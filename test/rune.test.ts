@@ -1,8 +1,9 @@
-import _ from 'lodash';
-import { U128_MAX_BIGINT, u128 } from '../src/u128';
+import * as _ from 'lodash';
+import { U128_MAX_BIGINT, u128 } from '../src/integer/u128';
 import { Rune } from '../src/rune';
-import { Chain } from '../src/chain';
+import { Network } from '../src/network';
 import { RESERVED, SUBSIDY_HALVING_INTERVAL } from '../src/constants';
+import { u64, u32 } from '../src/integer';
 
 describe('rune', () => {
   test('round trip', () => {
@@ -52,9 +53,7 @@ describe('rune', () => {
 
   test('mainnet minimum at height', () => {
     function testcase(height: number, minimum: string) {
-      expect(
-        Rune.getMinimumAtHeight(Chain.MAINNET, u128(height)).toString()
-      ).toEqual(minimum);
+      expect(Rune.getMinimumAtHeight(Network.MAINNET, u128(height)).toString()).toEqual(minimum);
     }
 
     const START = SUBSIDY_HALVING_INTERVAL * 4;
@@ -131,28 +130,29 @@ describe('rune', () => {
   });
 
   test('minimum at height', () => {
-    function testcase(chain: Chain, height: number, minimum: string) {
-      expect(Rune.getMinimumAtHeight(chain, u128(height)).toString()).toEqual(
-        minimum
-      );
+    function testcase(chain: Network, height: number, minimum: string) {
+      expect(Rune.getMinimumAtHeight(chain, u128(height)).toString()).toEqual(minimum);
     }
 
-    testcase(Chain.TESTNET, 0, 'AAAAAAAAAAAAA');
-    testcase(Chain.TESTNET, SUBSIDY_HALVING_INTERVAL * 12 - 1, 'AAAAAAAAAAAAA');
-    testcase(Chain.TESTNET, SUBSIDY_HALVING_INTERVAL * 12, 'ZZYZXBRKWXVA');
-    testcase(Chain.TESTNET, SUBSIDY_HALVING_INTERVAL * 12 + 1, 'ZZXZUDIVTVQA');
+    testcase(Network.TESTNET, 0, 'AAAAAAAAAAAAA');
+    testcase(Network.TESTNET, SUBSIDY_HALVING_INTERVAL * 12 - 1, 'AAAAAAAAAAAAA');
+    testcase(Network.TESTNET, SUBSIDY_HALVING_INTERVAL * 12, 'ZZYZXBRKWXVA');
+    testcase(Network.TESTNET, SUBSIDY_HALVING_INTERVAL * 12 + 1, 'ZZXZUDIVTVQA');
 
-    testcase(Chain.SIGNET, 0, 'ZZYZXBRKWXVA');
-    testcase(Chain.SIGNET, 1, 'ZZXZUDIVTVQA');
+    testcase(Network.SIGNET, 0, 'ZZYZXBRKWXVA');
+    testcase(Network.SIGNET, 1, 'ZZXZUDIVTVQA');
 
-    testcase(Chain.REGTEST, 0, 'ZZYZXBRKWXVA');
-    testcase(Chain.REGTEST, 1, 'ZZXZUDIVTVQA');
+    testcase(Network.REGTEST, 0, 'ZZYZXBRKWXVA');
+    testcase(Network.REGTEST, 1, 'ZZXZUDIVTVQA');
   });
 
   test('reserved', () => {
     expect(RESERVED).toBe(Rune.fromString('AAAAAAAAAAAAAAAAAAAAAAAAAAA').value);
-    expect(Rune.getReserved(u128(0)).value).toBe(RESERVED);
-    expect(Rune.getReserved(u128(1)).value).toBe(RESERVED + 1n);
+    expect(Rune.getReserved(u64(0), u32(0)).value).toBe(RESERVED);
+    expect(Rune.getReserved(u64(0), u32(1)).value).toBe(RESERVED + 1n);
+    expect(Rune.getReserved(u64(1), u32(0)).value).toBe(RESERVED + (1n << 32n));
+    expect(Rune.getReserved(u64(1), u32(1)).value).toBe(RESERVED + (1n << 32n) + 1n);
+    expect(Rune.getReserved(u64.MAX, u32.MAX).value).toBe(RESERVED + (u64.MAX << 32n) + u32.MAX);
   });
 
   test('is reserved', () => {
@@ -171,7 +171,7 @@ describe('rune', () => {
     let i = 0;
     while (true) {
       try {
-        const rune = Rune.fromString(_.repeat('A', i + 1));
+        const rune = Rune.fromString('A'.repeat(i + 1));
         expect(rune.value).toBe(Rune.STEPS[i]);
 
         i++;
@@ -180,5 +180,22 @@ describe('rune', () => {
         break;
       }
     }
+  });
+
+  test('commitment', () => {
+    function testcase(rune: number | u128, bytes: number[]) {
+      expect([...new Rune(u128(rune)).commitment]).toEqual(bytes);
+    }
+
+    testcase(0, []);
+    testcase(1, [1]);
+    testcase(255, [255]);
+    testcase(256, [0, 1]);
+    testcase(65535, [255, 255]);
+    testcase(65536, [0, 0, 1]);
+    testcase(
+      u128.MAX,
+      _.range(16).map(() => 255)
+    );
   });
 });

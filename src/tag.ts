@@ -1,15 +1,21 @@
-import { None, Option, Some } from '@sniptt/monads';
-import { u128 } from './u128';
+import { None, Option, Some } from './monads';
+import { u128 } from './integer';
+import { FixedArray } from './utils';
 
 export enum Tag {
   BODY = 0,
   FLAGS = 2,
   RUNE = 4,
-  LIMIT = 6,
-  TERM = 8,
-  DEADLINE = 10,
-  DEFAULT_OUTPUT = 12,
-  CLAIM = 14,
+
+  PREMINE = 6,
+  CAP = 8,
+  AMOUNT = 10,
+  HEIGHT_START = 12,
+  HEIGHT_END = 14,
+  OFFSET_START = 16,
+  OFFSET_END = 18,
+  MINT = 20,
+  POINTER = 22,
   CENOTAPH = 126,
 
   DIVISIBILITY = 1,
@@ -19,17 +25,46 @@ export enum Tag {
 }
 
 export namespace Tag {
-  export function take(fields: Map<u128, u128>, tag: Tag): Option<u128> {
-    const key = u128(tag);
-    const value = fields.get(key);
-    fields.delete(key);
-    return value ? Some(value) : None;
+  export function take<N extends number, T extends {}>(
+    tag: Tag,
+    fields: Map<u128, u128[]>,
+    n: N,
+    withFn: (values: FixedArray<u128, N>) => Option<T>
+  ): Option<T> {
+    const field = fields.get(u128(tag));
+    if (field === undefined) {
+      return None;
+    }
+
+    const values: u128[] = [];
+    for (const i of [...Array(n).keys()]) {
+      if (field[i] === undefined) {
+        return None;
+      }
+      values[i] = field[i];
+    }
+
+    const optionValue = withFn(values as FixedArray<u128, N>);
+    if (optionValue.isNone()) {
+      return None;
+    }
+
+    field.splice(0, n);
+
+    if (field.length === 0) {
+      fields.delete(u128(tag));
+    }
+
+    return Some(optionValue.unwrap());
   }
 
-  export function encode(tag: Tag, value: u128): Buffer {
-    return Buffer.concat([
-      u128.encodeVarInt(u128(tag)),
-      u128.encodeVarInt(value),
-    ]);
+  export function encode(tag: Tag, values: u128[]): Buffer {
+    return Buffer.concat(
+      values.map((value) => [u128.encodeVarInt(u128(tag)), u128.encodeVarInt(value)]).flat()
+    );
+  }
+
+  export function encodeOptionInt(tag: Tag, value: Option<number | bigint>) {
+    return value.map((value) => Tag.encode(tag, [u128(value)])).unwrapOr(Buffer.alloc(0));
   }
 }

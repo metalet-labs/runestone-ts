@@ -16,7 +16,7 @@
     "moduleResolution": "node",
     "sourceMap": true,
     "inlineSourceMap": false,
-    "esModuleInterop": true,
+    "esModuleInterop": false,
     "emitDecoratorMetadata": true,
     "experimentalDecorators": true,
     "composite": true,
@@ -25,10 +25,9 @@
     "resolveJsonModule": true
   },
   "include": [
+    "index.ts",
     "src/**/*.ts",
-    "src/**/*.json",
-    "test/**/*.ts",
-    "test/**/*.json"
+    "src/**/*.json"
   ],
   "exclude": ["node_modules", "dist"]
 }

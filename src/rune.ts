@@ -1,7 +1,6 @@
-import { Chain } from './chain';
+import { Network } from './network';
 import { RESERVED, SUBSIDY_HALVING_INTERVAL } from './constants';
-import { u128 } from './u128';
-import _ from 'lodash';
+import { u128, u32, u64 } from './integer';
 
 export class Rune {
   static readonly STEPS = [
@@ -37,12 +36,12 @@ export class Rune {
 
   constructor(readonly value: u128) {}
 
-  static getMinimumAtHeight(chain: Chain, height: u128) {
+  static getMinimumAtHeight(chain: Network, height: u128) {
     let offset = u128.saturatingAdd(height, u128(1));
 
     const INTERVAL = u128(SUBSIDY_HALVING_INTERVAL / 12);
 
-    let startSubsidyInterval = u128(Chain.getFirstRuneHeight(chain));
+    let startSubsidyInterval = u128(Network.getFirstRuneHeight(chain));
 
     let endSubsidyInterval = u128.saturatingAdd(
       startSubsidyInterval,
@@ -60,7 +59,7 @@ export class Rune {
     let progress = u128.saturatingSub(offset, startSubsidyInterval);
 
     let length = u128.saturatingSub(u128(12n), u128(progress / INTERVAL));
-    let lengthNumber = Number(length & 0xffff_ffffn);
+    let lengthNumber = Number(length & u128(u32.MAX));
 
     let endStepInterval = Rune.STEPS[lengthNumber];
 
@@ -69,10 +68,7 @@ export class Rune {
     let remainder = u128(progress % INTERVAL);
 
     return new Rune(
-      u128(
-        endStepInterval -
-          ((endStepInterval - startStepInterval) * remainder) / INTERVAL
-      )
+      u128(endStepInterval - ((endStepInterval - startStepInterval) * remainder) / INTERVAL)
     );
   }
 
@@ -80,8 +76,21 @@ export class Rune {
     return this.value >= RESERVED;
   }
 
-  static getReserved(n: u128): Rune {
-    return new Rune(u128.checkedAdd(RESERVED, n));
+  get commitment(): Buffer {
+    const bytes = Buffer.alloc(16);
+    bytes.writeBigUInt64LE(0xffffffff_ffffffffn & this.value, 0);
+    bytes.writeBigUInt64LE(this.value >> 64n, 8);
+
+    let end = bytes.length;
+    while (end > 0 && bytes.at(end - 1) === 0) {
+      end--;
+    }
+
+    return bytes.subarray(0, end);
+  }
+
+  static getReserved(block: u64, tx: u32): Rune {
+    return new Rune(u128.checkedAdd(RESERVED, u128((block << 32n) | tx)).unwrap());
   }
 
   toString() {
@@ -103,15 +112,15 @@ export class Rune {
 
   static fromString(s: string) {
     let x = u128(0);
-    for (const i of _.range(s.length)) {
+    for (const i of [...Array(s.length).keys()]) {
       const c = s[i];
 
       if (i > 0) {
         x = u128(x + 1n);
       }
-      x = u128.checkedMultiply(x, u128(26));
+      x = u128.checkedMultiply(x, u128(26)).unwrap();
       if ('A' <= c && c <= 'Z') {
-        x = u128.checkedAdd(x, u128(c.charCodeAt(0) - 'A'.charCodeAt(0)));
+        x = u128.checkedAdd(x, u128(c.charCodeAt(0) - 'A'.charCodeAt(0))).unwrap();
       } else {
         throw new Error(`invalid character in rune name: ${c}`);
       }

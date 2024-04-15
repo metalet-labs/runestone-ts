@@ -1,135 +1,174 @@
-import {
-  MAGIC_NUMBER,
-  MAX_DIVISIBILITY,
-  MAX_LIMIT,
-  MAX_SCRIPT_ELEMENT_SIZE,
-} from './constants';
+import { MAGIC_NUMBER, MAX_DIVISIBILITY, MAX_SCRIPT_ELEMENT_SIZE, OP_RETURN } from './constants';
 import { Edict } from './edict';
 import { Etching } from './etching';
 import { SeekBuffer } from './seekbuffer';
 import { Tag } from './tag';
-import { u128 } from './u128';
-import * as bitcoin from 'bitcoinjs-lib';
-import _ from 'lodash';
-import { Option, Some, None } from '@sniptt/monads';
+import { u128, u32, u64, u8 } from './integer';
+import { Option, Some, None } from './monads';
 import { Rune } from './rune';
 import { Flag } from './flag';
-import { Instruction, tryConvertInstructionToBuffer } from './utils';
+import { Instruction } from './utils';
 import { RuneId } from './runeid';
+import { script } from './script';
+import { Message } from './message';
+import { Artifact } from './artifact';
+import { Flaw } from './flaw';
+import { Cenotaph } from './cenotaph';
 
 export const MAX_SPACERS = 0b00000111_11111111_11111111_11111111;
 
+type RunestoneTx = { vout: { scriptPubKey: { hex: string } }[] };
+
+type Payload = Buffer | Flaw;
+
+export function isValidPayload(payload: Payload): payload is Buffer {
+  return Buffer.isBuffer(payload);
+}
+
 export class Runestone {
   constructor(
-    readonly cenotaph: boolean,
-    readonly claim: Option<RuneId>,
-    readonly defaultOutput: Option<number>,
+    readonly mint: Option<RuneId>,
+    readonly pointer: Option<u32>,
     readonly edicts: Edict[],
     readonly etching: Option<Etching>
   ) {}
 
-  static fromTransaction(transaction: bitcoin.Transaction): Option<Runestone> {
-    try {
-      return Runestone.decipher(transaction);
-    } catch (e) {
+  static decipher(transaction: RunestoneTx): Option<Artifact> {
+    const optionPayload = Runestone.payload(transaction);
+    if (optionPayload.isNone()) {
       return None;
     }
-  }
-
-  static decipher(transaction: bitcoin.Transaction): Option<Runestone> {
-    const payload = Runestone.payload(transaction);
-    if (payload.isNone()) {
-      return None;
+    const payload = optionPayload.unwrap();
+    if (!isValidPayload(payload)) {
+      return Some(new Cenotaph([payload]));
     }
 
-    const integers = Runestone.integers(payload.unwrap());
+    const optionIntegers = Runestone.integers(payload);
+    if (optionIntegers.isNone()) {
+      return Some(new Cenotaph([Flaw.VARINT]));
+    }
 
-    const { cenotaph, edicts, fields } = Message.fromIntegers(
-      transaction,
-      integers
+    const { flaws, edicts, fields } = Message.fromIntegers(
+      transaction.vout.length,
+      optionIntegers.unwrap()
     );
 
-    const claim = Tag.take(fields, Tag.CLAIM);
+    let flags = Tag.take(Tag.FLAGS, fields, 1, ([value]) => Some(value)).unwrapOr(u128(0));
 
-    const deadline = Tag.take(fields, Tag.DEADLINE).andThen((value) =>
-      value <= 0xffff_ffffn ? Some(Number(value)) : None
-    );
+    const etchingResult = Flag.take(flags, Flag.ETCHING);
+    const etchingFlag = etchingResult.set;
+    flags = etchingResult.flags;
 
-    const defaultOutput = Tag.take(fields, Tag.DEFAULT_OUTPUT).andThen(
-      (value) => (value <= 0xffff_ffffn ? Some(Number(value)) : None)
-    );
+    const etching: Option<Etching> = etchingFlag
+      ? (() => {
+          const divisibility = Tag.take(
+            Tag.DIVISIBILITY,
+            fields,
+            1,
+            ([value]): Option<u8> =>
+              u128
+                .tryIntoU8(value)
+                .andThen<u8>((value) => (value <= MAX_DIVISIBILITY ? Some(value) : None))
+          );
 
-    const divisibility = Tag.take(fields, Tag.DIVISIBILITY)
-      .andThen((value) => (value < 0xffn ? Some(Number(value)) : None))
-      .andThen((value) => (value <= MAX_DIVISIBILITY ? Some(value) : None))
-      .unwrapOr(0);
+          const rune = Tag.take(Tag.RUNE, fields, 1, ([value]) => Some(new Rune(value)));
 
-    const limit = Tag.take(fields, Tag.LIMIT).map((value) =>
-      value >= MAX_LIMIT ? MAX_LIMIT : value
-    );
+          const spacers = Tag.take(
+            Tag.SPACERS,
+            fields,
+            1,
+            ([value]): Option<u32> =>
+              u128.tryIntoU32(value).andThen((value) => (value <= MAX_SPACERS ? Some(value) : None))
+          );
 
-    const rune = Tag.take(fields, Tag.RUNE).map((value) => new Rune(value));
+          const symbol = Tag.take(Tag.SYMBOL, fields, 1, ([value]) =>
+            u128.tryIntoU32(value).andThen((value) => {
+              try {
+                return Some(String.fromCodePoint(Number(value)));
+              } catch (e) {
+                return None;
+              }
+            })
+          );
 
-    const spacers = Tag.take(fields, Tag.SPACERS)
-      .andThen<number>((value) => (value < 0xffn ? Some(Number(value)) : None))
-      .andThen<number>((value) => (value <= MAX_SPACERS ? Some(value) : None))
-      .unwrapOr(0);
+          const termsResult = Flag.take(flags, Flag.TERMS);
+          const termsFlag = termsResult.set;
+          flags = termsResult.flags;
 
-    const symbol = Tag.take(fields, Tag.SYMBOL)
-      .andThen<number>((value) =>
-        value <= 0xffff_ffffn ? Some(Number(value)) : None
-      )
-      .andThen<string>((value) => {
-        try {
-          return Some(String.fromCodePoint(value));
-        } catch (e) {
-          return None;
-        }
-      });
+          const terms = termsFlag
+            ? (() => {
+                const amount = Tag.take(Tag.AMOUNT, fields, 1, ([value]) => Some(value));
 
-    const term = Tag.take(fields, Tag.TERM).andThen((value) =>
-      value <= 0xffff_ffffn ? Some(Number(value)) : None
-    );
+                const cap = Tag.take(Tag.CAP, fields, 1, ([value]) => Some(value));
 
-    let flags = Tag.take(fields, Tag.FLAGS).unwrapOr(u128(0));
+                const offset = [
+                  Tag.take(Tag.OFFSET_START, fields, 1, ([value]) => u128.tryIntoU64(value)),
+                  Tag.take(Tag.OFFSET_END, fields, 1, ([value]) => u128.tryIntoU64(value)),
+                ] as const;
 
-    const etchResult = Flag.take(flags, Flag.ETCH);
-    const etch = etchResult.set;
-    flags = etchResult.flags;
+                const height = [
+                  Tag.take(Tag.HEIGHT_START, fields, 1, ([value]) => u128.tryIntoU64(value)),
+                  Tag.take(Tag.HEIGHT_END, fields, 1, ([value]) => u128.tryIntoU64(value)),
+                ] as const;
 
-    const mintResult = Flag.take(flags, Flag.MINT);
-    const mint = mintResult.set;
-    flags = mintResult.flags;
+                return Some({ amount, cap, offset, height });
+              })()
+            : None;
 
-    let etching: Option<Etching> = etch
-      ? Some(
-          new Etching(
-            divisibility,
-            rune,
-            spacers,
-            symbol,
-            mint
-              ? Some({
-                  deadline,
-                  limit,
-                  term,
-                })
-              : None
-          )
-        )
+          const premine = Tag.take(Tag.PREMINE, fields, 1, ([value]) => Some(value));
+
+          const turboResult = Flag.take(flags, Flag.TURBO);
+          const turbo = etchingResult.set;
+          flags = turboResult.flags;
+
+          return Some(new Etching(divisibility, rune, spacers, symbol, terms, premine, turbo));
+        })()
       : None;
 
-    return Some(
-      new Runestone(
-        cenotaph ||
-          flags !== 0n ||
-          [...fields.keys()].find((tag) => tag % 2n === 0n) !== undefined,
-        claim.map((value) => RuneId.fromU128(value)),
-        defaultOutput,
-        edicts,
-        etching
-      )
+    const mint = Tag.take(Tag.MINT, fields, 2, ([block, tx]): Option<RuneId> => {
+      const optionBlockU64 = u128.tryIntoU64(block);
+      const optionTxU32 = u128.tryIntoU32(tx);
+
+      if (optionBlockU64.isNone() || optionTxU32.isNone()) {
+        return None;
+      }
+
+      return RuneId.new(optionBlockU64.unwrap(), optionTxU32.unwrap());
+    });
+
+    const pointer = Tag.take(
+      Tag.POINTER,
+      fields,
+      1,
+      ([value]): Option<u32> =>
+        u128
+          .tryIntoU32(value)
+          .andThen((value) => (value < transaction.vout.length ? Some(value) : None))
     );
+
+    if (etching.map((etching) => etching.supply.isNone()).unwrapOr(false)) {
+      flaws.push(Flaw.SUPPLY_OVERFLOW);
+    }
+
+    if (flags !== 0n) {
+      flaws.push(Flaw.UNRECOGNIZED_FLAG);
+    }
+
+    if ([...fields.keys()].find((tag) => tag % 2n === 0n) !== undefined) {
+      flaws.push(Flaw.UNRECOGNIZED_EVEN_TAG);
+    }
+
+    if (flaws.length !== 0) {
+      return Some(
+        new Cenotaph(
+          flaws,
+          etching.andThen((etching) => etching.rune),
+          mint
+        )
+      );
+    }
+
+    return Some(new Runestone(mint, pointer, edicts, etching));
   }
 
   encipher(): Buffer {
@@ -138,83 +177,74 @@ export class Runestone {
     if (this.etching.isSome()) {
       const etching = this.etching.unwrap();
       let flags = u128(0);
-      flags = Flag.set(flags, Flag.ETCH);
+      flags = Flag.set(flags, Flag.ETCHING);
 
-      if (etching.mint.isSome()) {
-        flags = Flag.set(flags, Flag.MINT);
+      if (etching.terms.isSome()) {
+        flags = Flag.set(flags, Flag.TERMS);
       }
 
-      payloads.push(Tag.encode(Tag.FLAGS, flags));
-
-      if (etching.rune.isSome()) {
-        const rune = etching.rune.unwrap();
-        payloads.push(Tag.encode(Tag.RUNE, rune.value));
+      if (etching.turbo) {
+        flags = Flag.set(flags, Flag.TURBO);
       }
 
-      if (etching.divisibility !== 0) {
-        payloads.push(Tag.encode(Tag.DIVISIBILITY, u128(etching.divisibility)));
-      }
+      payloads.push(Tag.encode(Tag.FLAGS, [flags]));
 
-      if (etching.spacers !== 0) {
-        payloads.push(Tag.encode(Tag.SPACERS, u128(etching.spacers)));
-      }
+      payloads.push(
+        Tag.encodeOptionInt(
+          Tag.RUNE,
+          etching.rune.map((rune) => rune.value)
+        )
+      );
+      payloads.push(Tag.encodeOptionInt(Tag.DIVISIBILITY, etching.divisibility.map(u128)));
+      payloads.push(Tag.encodeOptionInt(Tag.SPACERS, etching.spacers.map(u128)));
+      payloads.push(
+        Tag.encodeOptionInt(
+          Tag.SYMBOL,
+          etching.symbol.map((symbol) => u128(symbol.codePointAt(0)!))
+        )
+      );
+      payloads.push(Tag.encodeOptionInt(Tag.PREMINE, etching.premine));
 
-      if (etching.symbol.isSome()) {
-        const symbol = etching.symbol.unwrap();
-        payloads.push(Tag.encode(Tag.SYMBOL, u128(symbol.codePointAt(0)!)));
-      }
+      if (etching.terms.isSome()) {
+        const terms = etching.terms.unwrap();
 
-      if (etching.mint.isSome()) {
-        const mint = etching.mint.unwrap();
-
-        if (mint.deadline.isSome()) {
-          const deadline = mint.deadline.unwrap();
-          payloads.push(Tag.encode(Tag.DEADLINE, u128(deadline)));
-        }
-
-        if (mint.limit.isSome()) {
-          const limit = mint.limit.unwrap();
-          payloads.push(Tag.encode(Tag.LIMIT, limit));
-        }
-
-        if (mint.term.isSome()) {
-          const term = mint.term.unwrap();
-          payloads.push(Tag.encode(Tag.TERM, u128(term)));
-        }
+        payloads.push(Tag.encodeOptionInt(Tag.AMOUNT, terms.amount));
+        payloads.push(Tag.encodeOptionInt(Tag.CAP, terms.cap));
+        payloads.push(Tag.encodeOptionInt(Tag.HEIGHT_START, terms.height[0]));
+        payloads.push(Tag.encodeOptionInt(Tag.HEIGHT_END, terms.height[1]));
+        payloads.push(Tag.encodeOptionInt(Tag.OFFSET_START, terms.offset[0]));
+        payloads.push(Tag.encodeOptionInt(Tag.OFFSET_END, terms.offset[1]));
       }
     }
 
-    if (this.claim.isSome()) {
-      const claim = this.claim.unwrap();
-      payloads.push(Tag.encode(Tag.CLAIM, claim.toU128()));
+    if (this.mint.isSome()) {
+      const claim = this.mint.unwrap();
+      payloads.push(Tag.encode(Tag.MINT, [claim.block, claim.tx].map(u128)));
     }
 
-    if (this.defaultOutput.isSome()) {
-      const defaultOutput = this.defaultOutput.unwrap();
-      payloads.push(Tag.encode(Tag.DEFAULT_OUTPUT, u128(defaultOutput)));
-    }
-
-    if (this.cenotaph) {
-      payloads.push(Tag.encode(Tag.CENOTAPH, u128(0)));
-    }
+    payloads.push(Tag.encodeOptionInt(Tag.POINTER, this.pointer.map(u128)));
 
     if (this.edicts.length) {
       payloads.push(u128.encodeVarInt(u128(Tag.BODY)));
 
-      const edicts = _.sortBy(this.edicts, (edict) => edict.id);
+      const edicts = [...this.edicts].sort((x, y) =>
+        Number(x.id.block - y.id.block || x.id.tx - y.id.tx)
+      );
 
-      let id = u128(0);
+      let previous = new RuneId(u64(0), u32(0));
       for (const edict of edicts) {
-        const next = edict.id.toU128();
-        payloads.push(u128.encodeVarInt(u128(next - id)));
+        const [block, tx] = previous.delta(edict.id).unwrap();
+
+        payloads.push(u128.encodeVarInt(block));
+        payloads.push(u128.encodeVarInt(tx));
         payloads.push(u128.encodeVarInt(edict.amount));
-        payloads.push(u128.encodeVarInt(edict.output));
-        id = next;
+        payloads.push(u128.encodeVarInt(u128(edict.output)));
+        previous = edict.id;
       }
     }
 
-    const stack: bitcoin.Stack = [];
-    stack.push(bitcoin.opcodes.OP_RETURN);
+    const stack: (Buffer | number)[] = [];
+    stack.push(OP_RETURN);
     stack.push(MAGIC_NUMBER);
 
     const payload = Buffer.concat(payloads);
@@ -223,40 +253,54 @@ export class Runestone {
       stack.push(payload.subarray(i, i + MAX_SCRIPT_ELEMENT_SIZE));
     }
 
-    return bitcoin.script.compile(stack);
+    return script.compile(stack);
   }
 
-  static payload(transaction: bitcoin.Transaction): Option<Buffer> {
-    for (const output of transaction.outs) {
-      const instructions = bitcoin.script.decompile(output.script);
+  static payload(transaction: RunestoneTx): Option<Payload> {
+    // search transaction outputs for payload
+    for (const output of transaction.vout) {
+      const instructions = script.decompile(Buffer.from(output.scriptPubKey.hex, 'hex'));
       if (instructions === null) {
         throw new Error('unable to decompile');
       }
 
-      let nextInstruction: Instruction | undefined;
-
-      nextInstruction = instructions.shift();
-      if (nextInstruction !== bitcoin.opcodes.OP_RETURN) {
+      // payload starts with OP_RETURN
+      let nextInstructionResult = instructions.next();
+      if (nextInstructionResult.done || nextInstructionResult.value !== OP_RETURN) {
         continue;
       }
 
-      nextInstruction = instructions.shift();
+      // followed by the protocol identifier
+      nextInstructionResult = instructions.next();
       if (
-        !nextInstruction ||
-        Instruction.isBuffer(nextInstruction) ||
-        nextInstruction !== MAGIC_NUMBER
+        nextInstructionResult.done ||
+        Instruction.isBuffer(nextInstructionResult.value) ||
+        nextInstructionResult.value !== MAGIC_NUMBER
       ) {
         continue;
       }
 
+      // construct the payload by concatinating remaining data pushes
       let payloads: Buffer[] = [];
 
-      for (const instruction of instructions) {
-        const result = tryConvertInstructionToBuffer(instruction);
-        if (Instruction.isBuffer(result)) {
-          payloads.push(result);
+      do {
+        nextInstructionResult = instructions.next();
+
+        if (nextInstructionResult.done) {
+          const decodedSuccessfully = nextInstructionResult.value;
+          if (!decodedSuccessfully) {
+            return Some(Flaw.INVALID_SCRIPT);
+          }
+          break;
         }
-      }
+
+        const instruction = nextInstructionResult.value;
+        if (Instruction.isBuffer(instruction)) {
+          payloads.push(instruction);
+        } else {
+          return Some(Flaw.OPCODE);
+        }
+      } while (true);
 
       return Some(Buffer.concat(payloads));
     }
@@ -264,62 +308,18 @@ export class Runestone {
     return None;
   }
 
-  static integers(payload: Buffer): u128[] {
+  static integers(payload: Buffer): Option<u128[]> {
     const integers: u128[] = [];
 
     const seekBuffer = new SeekBuffer(payload);
     while (!seekBuffer.isFinished()) {
-      integers.push(u128.readVarInt(seekBuffer));
+      const optionInt = u128.decodeVarInt(seekBuffer);
+      if (optionInt.isNone()) {
+        return None;
+      }
+      integers.push(optionInt.unwrap());
     }
 
-    return integers;
-  }
-}
-
-export class Message {
-  constructor(
-    readonly cenotaph: boolean,
-    readonly edicts: Edict[],
-    readonly fields: Map<u128, u128>
-  ) {}
-
-  static fromIntegers(tx: bitcoin.Transaction, payload: u128[]): Message {
-    const edicts: Edict[] = [];
-    const fields = new Map<u128, u128>();
-    let cenotaph = false;
-
-    for (const i of _.range(0, payload.length, 2)) {
-      const tag = payload[i];
-
-      if (u128(Tag.BODY) === tag) {
-        let id = u128(0);
-        for (const chunk of _.chunk(payload.slice(i + 1), 3)) {
-          if (chunk.length !== 3) {
-            break;
-          }
-
-          id = u128.saturatingAdd(id, chunk[0]);
-
-          const optionEdict = Edict.fromIntegers(tx, id, chunk[1], chunk[2]);
-          if (optionEdict.isSome()) {
-            edicts.push(optionEdict.unwrap());
-          } else {
-            cenotaph = true;
-          }
-        }
-        break;
-      }
-
-      const value = payload[i + 1];
-      if (value === undefined) {
-        break;
-      }
-
-      if (!fields.has(tag)) {
-        fields.set(tag, value);
-      }
-    }
-
-    return new Message(cenotaph, edicts, fields);
+    return Some(integers);
   }
 }
